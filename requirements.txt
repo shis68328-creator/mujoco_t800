@@ -19,8 +19,8 @@ gymnasium==1.2.3
 stable-baselines3==2.8.0
 torch==2.7.1+cu128
 
+# 09cuda.py --tensorboard 用来记录训练曲线
+tensorboard==2.20.0
+
 # 可选：只有运行 09.py --demo（加载 SDK 预训练策略）时才需要
 # MNN==3.6.2
-
-# 可选：想在 TensorBoard 里看训练曲线时再装
-# tensorboard
