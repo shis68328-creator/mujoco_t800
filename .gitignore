@@ -1,0 +1,9 @@
+.DS_Store
+__pycache__/
+.venv/
+.pip-cache/
+.vscode/
+t800_walk_model*/
+engineai_robotics_native_sdk-main/
+MNN-CODE/
+t800_skeleton.png
