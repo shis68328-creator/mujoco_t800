@@ -1,0 +1,26 @@
+# T800 MuJoCo 行走训练依赖（Ubuntu + RTX 5070 Ti）
+#
+# 建议 Python 3.11：
+#   conda create -n t800 python=3.11 -y
+#   conda activate t800
+#   pip install -r requirements.txt
+#
+# 注意：RTX 5070 Ti 是 Blackwell 架构（sm_120），必须用 CUDA 12.8 及以上的
+# PyTorch；macOS 上用的 torch 2.5.1 没有 sm_120 内核，装到 Ubuntu 上会
+# 只能用 CPU 或直接报错。所以这里固定 torch 2.7.1 + cu128。
+# 显卡驱动需要 >= 570（支持 CUDA 12.8）。
+
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+mujoco==3.4.0
+numpy==2.3.5
+matplotlib==3.11.2
+gymnasium==1.2.3
+stable-baselines3==2.8.0
+torch==2.7.1+cu128
+
+# 可选：只有运行 09.py --demo（加载 SDK 预训练策略）时才需要
+# MNN==3.6.2
+
+# 可选：想在 TensorBoard 里看训练曲线时再装
+# tensorboard
