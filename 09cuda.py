@@ -102,7 +102,16 @@
   - 新的 PPO 超参数
 
 注意：观测维度从 48 变成 49，旧模型不能直接 resume，
-请用新的保存目录（默认 t800_walk_model_v2）从头训练。
+请用新的保存目录（默认 t800_walk_model_v3）从头训练。
+
+======================================================================
+五、针对“跳着走、膝盖不弯、上半身不动”的改动
+======================================================================
+  - 双脚同时离地要惩罚（抑制蹦跳），双脚着地给一点奖励
+  - 基座竖直方向速度平方惩罚，抑制上下弹跳
+  - 摆动腿膝盖弯曲给奖励，鼓励抬腿时屈膝
+  - 肩关节按步态相位反相摆动，肘关节保持微弯，
+    这样上半身会自然摆起来（不需要额外动作维度）
 """
 
 from __future__ import annotations  # 让类型注解可以写 MjModel | None 这种语法
@@ -158,6 +167,9 @@ PHASE_FREQ = 1.5            # 步态相位频率 Hz，给策略一个周期时�
 # 两个脚对应的 body 名字：用来算脚的高度、速度、是否着地
 FOOT_BODIES = ("LINK_FOOT_L", "LINK_FOOT_R")
 FOOT_CONTACT_Z = 0.095      # 脚 body 高度低于这个值，认为脚踩在地上
+
+ARM_SWING = 0.25            # 肩关节前后摆动幅度（rad）
+ELBOW_BEND = -0.25          # 肘关节常弯角度（rad），避免手臂笔直
 
 # 每个进程各自缓存一个 MuJoCo 模型；父进程不建，子进程 fork 后各自建
 _MODEL: mujoco.MjModel | None = None
@@ -256,6 +268,24 @@ class T800WalkEnv(gym.Env):
         ]
         self.prev_foot_pos = None  # 上一步脚的位置，用来算脚的速度
 
+        # 膝盖的 qpos 下标（左、右），用来奖励屈膝
+        self.knee_qadr = np.array([
+            int(self.model.jnt_qposadr[
+                mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
+            ])
+            for name in ("J03_KNEE_PITCH_L", "J09_KNEE_PITCH_R")
+        ])
+
+        # 肩 pitch 和肘 pitch 对应的执行器下标，用来做脚本化摆臂
+        def actuator_id(joint_name):
+            jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+            return int(np.where(self.act_joint == jid)[0][0])
+
+        self.arm_sh_l = actuator_id("J13_SHOULDER_PITCH_L")
+        self.arm_sh_r = actuator_id("J18_SHOULDER_PITCH_R")
+        self.arm_elbow_l = actuator_id("J16_ELBOW_PITCH_L")
+        self.arm_elbow_r = actuator_id("J21_ELBOW_PITCH_R")
+
         # ---- 运行时的辅助变量 ----
         self.step_count = 0                          # 当前 episode 走了几个控制步
         self.prev_action = np.zeros(12, dtype=np.float64)  # 上一步动作（给观测用）
@@ -334,11 +364,29 @@ class T800WalkEnv(gym.Env):
 
         # 支撑脚在地面滑动要惩罚：脚贴地但水平速度大 => 扣分
         r_slide = -0.5 * float(np.sum(foot_speed_xy[contact] ** 2))
-        # 摆动脚抬到 9~15 cm 给奖励，拖脚不给
+        # 单脚支撑：一只脚在摆、另一只脚着地
+        single_support = int(np.sum(contact)) == 1
+
+        # 摆动脚抬到 9~15 cm 给奖励，拖脚不给（权重别太大，避免高抬腿）
         lift = np.clip((foot_z - 0.09) / 0.06, 0.0, 1.0)
-        r_lift = 0.25 * float(np.sum(lift[swing]))
-        # 单脚支撑奖励：一只脚在摆、另一只脚着地，鼓励交替迈步
-        r_single_support = 0.15 if int(np.sum(contact)) == 1 else 0.0
+        r_lift = 0.15 * float(np.sum(lift[swing])) if single_support else 0.0
+        # 单脚支撑奖励：鼓励交替迈步
+        r_single_support = 0.15 if single_support else 0.0
+
+        # ---- 3.1 抑制蹦跳 ----
+        # 双脚同时离地：像小跳，扣分
+        r_flight = -0.4 if int(np.sum(contact)) == 0 else 0.0
+        # 双脚同时着地：走路时常见的双支撑，给一点奖励
+        r_double_support = 0.1 if int(np.sum(contact)) == 2 else 0.0
+        # 基座上下弹跳：竖直速度平方惩罚
+        r_vertical = -0.4 * float(data.qvel[2] ** 2)
+
+        # ---- 3.2 摆动腿屈膝奖励 ----
+        # 抬腿时膝盖要弯（>0.1 rad 才开始给分，0.3 rad 满分）
+        knee_angle = data.qpos[self.knee_qadr]
+        knee_bend = np.clip((knee_angle - 0.1) / 0.2, 0.0, 1.0)
+        # 只在单脚支撑时奖励屈膝，避免“双脚离地+双双屈膝”骗奖励
+        r_knee = 0.2 * float(np.sum(knee_bend[swing])) if single_support else 0.0
 
         # ---- 4. 平滑和能耗惩罚 ----
         r_torque = 1e-6 * float(np.sum(tau ** 2))
@@ -348,6 +396,7 @@ class T800WalkEnv(gym.Env):
 
         return (r_track + r_lateral + r_upright + r_height + r_alive
                 + r_slide + r_lift + r_single_support
+                + r_flight + r_double_support + r_vertical + r_knee
                 - r_torque - r_action_rate - r_joint_vel - r_yaw)
 
     def step(self, action):
@@ -363,6 +412,14 @@ class T800WalkEnv(gym.Env):
         # 目标角度 = 默认角度 + 动作 × 缩放系数
         target = self.default_q.copy()
         target[self.leg_act_idx] += action * ACTION_SCALE
+
+        # 脚本化上半身：肩膀随步态相位前后摆，肘关节保持微弯。
+        # 这不占用动作维度，策略只专注腿，但看起来不会像两根木棍。
+        swing = math.sin(2.0 * math.pi * self.phase)
+        target[self.arm_sh_l] += ARM_SWING * swing
+        target[self.arm_sh_r] -= ARM_SWING * swing
+        target[self.arm_elbow_l] = ELBOW_BEND
+        target[self.arm_elbow_r] = ELBOW_BEND
 
         # 一个控制步内部做 FRAME_SKIP 次物理步（50 Hz 控制，500 Hz 物理）
         tau = np.zeros(self.model.nu)
@@ -692,7 +749,7 @@ def main() -> int:
                         help="PPO 小批量大小")
     parser.add_argument("--seed", type=int, default=0, help="随机种子")
     parser.add_argument("--device", type=str, default="cuda", help="cuda 或 cpu")
-    parser.add_argument("--save-dir", type=str, default="t800_walk_model_v2",
+    parser.add_argument("--save-dir", type=str, default="t800_walk_model_v3",
                         help="模型保存目录")
     parser.add_argument("--save-freq", type=int, default=500_000,
                         help="每多少环境步保存一次")
